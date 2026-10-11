@@ -15,6 +15,8 @@ on:
     tags:
       # https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#filter-pattern-cheat-sheet
       - '[1-2].[0-9]+.[0-9]+'
+      # nova-orion fork: patched releases, see .github/workflows/sync-upstream.yml
+      - '[1-2].[0-9]+.[0-9]+-nova.[0-9]+'
 
 defaults:
   run:
@@ -37,7 +39,9 @@ defaults:
 jobs:
   docker-build:
     name: Build Vaultwarden containers
-    if: ${{ github.repository == 'dani-garcia/vaultwarden' }}
+    # nova-orion fork: only patched tags are built, never upstream tags or branches,
+    # so an unpatched image can't be published as latest/testing.
+    if: ${{ github.repository == 'dani-garcia/vaultwarden' || (github.repository == 'nova-orion/vaultwarden' && github.ref_type == 'tag' && contains(github.ref_name, '-nova.')) }}
     environment: 
       name: release
       deployment: false
