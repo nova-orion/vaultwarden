@@ -393,9 +393,11 @@ async fn get_org_collections_details(org_id: OrganizationId, headers: ManagerHea
 
     // Get all admins, owners and managers who can manage/access all
     // Those are currently not listed in the col_users but need to be listed too.
+    // Owners/Admins with collections assigned are listed through their col_users instead
     let manage_all_members: Vec<Value> = Membership::find_confirmed_and_manage_all_by_org(&org_id, &conn)
         .await
         .into_iter()
+        .filter(|member| member.access_all)
         .map(|member| {
             json!({
                 "id": member.uuid,
@@ -1021,6 +1023,13 @@ async fn send_invite(
             && data.permissions.get("editAnyCollection") == Some(&json!(true))
             && data.permissions.get("deleteAnyCollection") == Some(&json!(true))
             && data.permissions.get("createNewCollections") == Some(&json!(true)));
+    // Owners/Admins invited with collections assigned only see those in their own vault.
+    // Inviting them without collections keeps full access.
+    let access_all = if new_type >= MembershipType::Admin {
+        data.collections.as_deref().is_none_or(<[_]>::is_empty)
+    } else {
+        access_all
+    };
 
     let mut user_created: bool;
     for email in &data.emails {
@@ -1535,6 +1544,18 @@ async fn edit_member(
         }
     }
 
+    // Owners/Admins with collections assigned only see those in their own vault; none assigned keeps full access.
+    // Only Owners change this, and any role change (including Admin <-> Owner) starts with full access.
+    let stays_admin = new_type == member_to_edit.atype && new_type >= MembershipType::Admin;
+    let keep_collections = stays_admin && headers.membership_type != MembershipType::Owner;
+    let access_all = if keep_collections {
+        member_to_edit.access_all
+    } else if stays_admin {
+        data.collections.as_deref().is_none_or(<[_]>::is_empty)
+    } else {
+        access_all
+    };
+
     member_to_edit.access_all = access_all;
     member_to_edit.atype = new_type as i32;
 
@@ -1542,26 +1563,28 @@ async fn edit_member(
     // We need to perform the check after changing the type since `admin` is exempt.
     OrgPolicy::check_user_allowed(&member_to_edit, "modify", &conn).await?;
 
-    // Delete all the odd collections
-    for c in CollectionUser::find_by_organization_and_user_uuid(&org_id, &member_to_edit.user_uuid, &conn).await {
-        c.delete(&conn).await?;
-    }
+    if !keep_collections {
+        // Delete all the odd collections
+        for c in CollectionUser::find_by_organization_and_user_uuid(&org_id, &member_to_edit.user_uuid, &conn).await {
+            c.delete(&conn).await?;
+        }
 
-    // If no accessAll, add the collections received
-    if !access_all {
-        for col in data.collections.iter().flatten() {
-            match Collection::find_by_uuid_and_org(&col.id, &org_id, &conn).await {
-                None => err!("Collection not found in Organization"),
-                Some(collection) => {
-                    CollectionUser::save(
-                        &member_to_edit.user_uuid,
-                        &collection.uuid,
-                        col.read_only,
-                        col.hide_passwords,
-                        col.manage,
-                        &conn,
-                    )
-                    .await?;
+        // If no accessAll, add the collections received
+        if !access_all {
+            for col in data.collections.iter().flatten() {
+                match Collection::find_by_uuid_and_org(&col.id, &org_id, &conn).await {
+                    None => err!("Collection not found in Organization"),
+                    Some(collection) => {
+                        CollectionUser::save(
+                            &member_to_edit.user_uuid,
+                            &collection.uuid,
+                            col.read_only,
+                            col.hide_passwords,
+                            col.manage,
+                            &conn,
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -1871,24 +1894,31 @@ struct BulkCollectionsData {
 async fn post_bulk_collections(data: Json<BulkCollectionsData>, headers: Headers, conn: DbConn) -> EmptyResult {
     let data: BulkCollectionsData = data.into_inner();
 
-    if Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &data.organization_id, &conn).await.is_none() {
+    let Some(member) =
+        Membership::find_confirmed_by_user_and_org(&headers.user.uuid, &data.organization_id, &conn).await
+    else {
         err!("You need to be a Member of the Organization to call this endpoint")
-    }
+    };
+
+    // Owners/Admins with collections assigned can still manage every collection from the Admin Console
+    let org_collections = if member.has_full_access() {
+        Collection::find_by_organization(&data.organization_id, &conn).await
+    } else {
+        Collection::find_by_organization_and_user_uuid(&data.organization_id, &headers.user.uuid, &conn).await
+    };
 
     // Get all the collection available to the user in one query
     // Also filter based upon the provided collections
-    let user_collections: HashMap<CollectionId, Collection> =
-        Collection::find_by_organization_and_user_uuid(&data.organization_id, &headers.user.uuid, &conn)
-            .await
-            .into_iter()
-            .filter_map(|c| {
-                if data.collection_ids.contains(&c.uuid) {
-                    Some((c.uuid.clone(), c))
-                } else {
-                    None
-                }
-            })
-            .collect();
+    let user_collections: HashMap<CollectionId, Collection> = org_collections
+        .into_iter()
+        .filter_map(|c| {
+            if data.collection_ids.contains(&c.uuid) {
+                Some((c.uuid.clone(), c))
+            } else {
+                None
+            }
+        })
+        .collect();
 
     // Verify if all the collections requested exists and are writable for the user, else abort
     for collection_uuid in &data.collection_ids {
