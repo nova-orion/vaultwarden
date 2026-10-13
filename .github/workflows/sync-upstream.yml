@@ -1,0 +1,135 @@
+name: Sync upstream release
+permissions: {}
+
+# nova-orion fork only, run manually (Actions > Sync upstream release > Run workflow).
+# Rebases the patch branch onto the latest upstream release, runs the tests, then pushes
+# the branch and a `<version>-nova.<n>` tag, which triggers release.yml.
+# A rebase conflict or a failing test stops the job before anything is pushed.
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync:
+    name: Rebase patch onto latest upstream release
+    if: ${{ github.repository == 'nova-orion/vaultwarden' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read # Pushing uses the SYNC_DEPLOY_KEY deploy key, GITHUB_TOKEN pushes can't trigger release.yml or touch workflow files
+    env:
+      PATCH_BRANCH: nova
+      UPSTREAM_REPO: dani-garcia/vaultwarden
+      RUSTFLAGS: "-Dwarnings"
+
+    steps:
+      - name: Check SYNC_DEPLOY_KEY
+        env:
+          SYNC_DEPLOY_KEY: ${{ secrets.SYNC_DEPLOY_KEY }}
+        run: |
+          if [[ -z "${SYNC_DEPLOY_KEY}" ]]; then
+            echo "::error::Secret SYNC_DEPLOY_KEY is missing (private key of a deploy key with write access on this repo)"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Rebase onto latest upstream release
+        id: rebase
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          LATEST="$(gh api "repos/${UPSTREAM_REPO}/releases/latest" --jq .tag_name)"
+          if [[ ! "${LATEST}" =~ ^[1-2]\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Unexpected upstream release tag '${LATEST}'"
+            exit 1
+          fi
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "+refs/tags/*:refs/tags/*"
+
+          BASE="$(git describe --tags --abbrev=0 --match '[1-2].*' --exclude '*-*' HEAD)"
+          echo "Patch branch is based on ${BASE}, latest upstream release is ${LATEST}"
+
+          if [[ "$(printf '%s\n%s\n' "${BASE}" "${LATEST}" | sort -V | tail -n1)" != "${LATEST}" ]]; then
+            echo "Patch branch is ahead of the latest upstream release, nothing to do"
+            exit 0
+          fi
+
+          if [[ "${BASE}" == "${LATEST}" ]]; then
+            if [[ -n "$(git tag --points-at HEAD --list "${LATEST}-nova.*")" ]]; then
+              echo "Already released, nothing to do"
+              exit 0
+            fi
+          else
+            if ! git rebase --onto "${LATEST}" "${BASE}"; then
+              git rebase --abort
+              echo "::error::Patch does not apply cleanly on ${LATEST}, rebase ${PATCH_BRANCH} manually"
+              exit 1
+            fi
+          fi
+
+          LAST_N="$(git tag --list "${LATEST}-nova.*" | sed "s/^${LATEST}-nova\.//" | sort -n | tail -n1)"
+          TAG="${LATEST}-nova.$(( ${LAST_N:-0} + 1 ))"
+          echo "Will release ${TAG}"
+          echo "TAG=${TAG}" | tee -a "${GITHUB_OUTPUT}"
+
+      - name: Install dependencies Ubuntu
+        if: ${{ steps.rebase.outputs.TAG != '' }}
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl build-essential libmariadb-dev-compat libpq-dev libssl-dev pkg-config
+
+      - name: Install toolchain
+        if: ${{ steps.rebase.outputs.TAG != '' }}
+        run: |
+          RUST_TOOLCHAIN="$(grep -m1 -oP 'channel.*"(\K.*?)(?=")' rust-toolchain.toml)"
+          rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal --component clippy --no-self-update
+          rustc -vV
+          cargo -vV
+
+      - name: Rust Caching
+        if: ${{ steps.rebase.outputs.TAG != '' }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: "v2025.09-rust"
+
+      - name: Test
+        if: ${{ steps.rebase.outputs.TAG != '' }}
+        run: cargo test --profile ci --features sqlite,mysql,postgresql
+
+      - name: Clippy
+        if: ${{ steps.rebase.outputs.TAG != '' }}
+        run: cargo clippy --profile ci --features sqlite,mysql,postgresql
+
+      - name: Push branch and release tag
+        if: ${{ steps.rebase.outputs.TAG != '' }}
+        env:
+          SYNC_DEPLOY_KEY: ${{ secrets.SYNC_DEPLOY_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.rebase.outputs.TAG }}
+        run: |
+          KEY_FILE="${RUNNER_TEMP}/sync_deploy_key"
+          KNOWN_HOSTS="${RUNNER_TEMP}/known_hosts"
+          trap 'rm -f "${KEY_FILE}"' EXIT
+          (umask 077 && printf '%s\n' "${SYNC_DEPLOY_KEY}" > "${KEY_FILE}")
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "${KNOWN_HOSTS}"
+          export GIT_SSH_COMMAND="ssh -i ${KEY_FILE} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS}"
+
+          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
+          git tag -a "${TAG}" -m "${TAG}"
+          git push --atomic --force-with-lease="${PATCH_BRANCH}" origin "HEAD:refs/heads/${PATCH_BRANCH}" "refs/tags/${TAG}"
