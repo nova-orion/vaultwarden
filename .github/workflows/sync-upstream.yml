@@ -1,7 +1,7 @@
 name: Sync upstream release
 permissions: {}
 
-# nova-orion fork only.
+# nova-orion fork only, run manually (Actions > Sync upstream release > Run workflow).
 # Rebases the patch branch onto the latest upstream release, runs the tests, then pushes
 # the branch and a `<version>-nova.<n>` tag, which triggers release.yml.
 # A rebase conflict or a failing test stops the job before anything is pushed.
@@ -11,8 +11,6 @@ concurrency:
   cancel-in-progress: false
 
 on:
-  schedule:
-    - cron: "23 */6 * * *"
   workflow_dispatch:
 
 defaults:
@@ -26,19 +24,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
-      contents: read # Pushing uses SYNC_TOKEN, GITHUB_TOKEN pushes can't trigger release.yml or touch workflow files
+      contents: read # Pushing uses the SYNC_DEPLOY_KEY deploy key, GITHUB_TOKEN pushes can't trigger release.yml or touch workflow files
     env:
       PATCH_BRANCH: nova
       UPSTREAM_REPO: dani-garcia/vaultwarden
       RUSTFLAGS: "-Dwarnings"
 
     steps:
-      - name: Check SYNC_TOKEN
+      - name: Check SYNC_DEPLOY_KEY
         env:
-          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          SYNC_DEPLOY_KEY: ${{ secrets.SYNC_DEPLOY_KEY }}
         run: |
-          if [[ -z "${SYNC_TOKEN}" ]]; then
-            echo "::error::Secret SYNC_TOKEN is missing (fine-grained PAT with Contents and Workflows read/write on this repo)"
+          if [[ -z "${SYNC_DEPLOY_KEY}" ]]; then
+            echo "::error::Secret SYNC_DEPLOY_KEY is missing (private key of a deploy key with write access on this repo)"
             exit 1
           fi
 
@@ -121,9 +119,17 @@ jobs:
       - name: Push branch and release tag
         if: ${{ steps.rebase.outputs.TAG != '' }}
         env:
-          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          SYNC_DEPLOY_KEY: ${{ secrets.SYNC_DEPLOY_KEY }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.rebase.outputs.TAG }}
         run: |
-          git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          KEY_FILE="${RUNNER_TEMP}/sync_deploy_key"
+          KNOWN_HOSTS="${RUNNER_TEMP}/known_hosts"
+          trap 'rm -f "${KEY_FILE}"' EXIT
+          (umask 077 && printf '%s\n' "${SYNC_DEPLOY_KEY}" > "${KEY_FILE}")
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "${KNOWN_HOSTS}"
+          export GIT_SSH_COMMAND="ssh -i ${KEY_FILE} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${KNOWN_HOSTS}"
+
+          git remote set-url origin "git@github.com:${GITHUB_REPOSITORY}.git"
           git tag -a "${TAG}" -m "${TAG}"
           git push --atomic --force-with-lease="${PATCH_BRANCH}" origin "HEAD:refs/heads/${PATCH_BRANCH}" "refs/tags/${TAG}"
